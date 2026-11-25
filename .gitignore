@@ -1,0 +1,6 @@
+bin/
+obj/
+.vs/
+.idea/
+Retoc Extractor.csproj.user
+Retoc Extractor.slnx
