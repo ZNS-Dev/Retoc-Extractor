@@ -2,6 +2,7 @@
 
 > \[!IMPORTANT]
 > The application uses [retoc](https://github.com/trumank/retoc) made by trumank.
+> The application interface was inspired by [FModel](https://fmodel.app/) (I also redesigned the icon because the application resembles FModel).
 
 > [!NOTE]
 > **Retoc Extractor** is an application that allows you to export assets in uasset/uexp thanks to the application [retoc](https://github.com/trumank/retoc).
