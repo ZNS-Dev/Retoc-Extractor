@@ -1,11 +1,13 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -20,10 +22,8 @@ namespace RetocExtractor.RetocExtractor.Codes
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            AppSettings settings = SettingsStore.Load();
             try
             {
-
                 RetocBootstrapper.EnsureRetocAvailable();
             }
             catch (Exception ex)
@@ -36,6 +36,7 @@ namespace RetocExtractor.RetocExtractor.Codes
                 return;
             }
 
+            AppSettings settings = SettingsStore.Load();
             Application.Run(new MainForm(settings));
         }
     }
@@ -58,80 +59,170 @@ namespace RetocExtractor.RetocExtractor.Codes
             string retocPath = Path.Combine(dataDirectory, "retoc.exe");
             string zipPath = Path.Combine(dataDirectory, "retoc-download.tmp.zip");
             string extractedPath = Path.Combine(dataDirectory, "retoc-download.tmp.exe");
+            string backupPath = Path.Combine(dataDirectory, "retoc-update-backup.tmp.exe");
 
             TryDelete(zipPath);
             TryDelete(extractedPath);
+            RecoverInterruptedUpdate(retocPath, backupPath);
 
-            if (IsUsableExecutable(retocPath))
-                return;
+            bool hasUsableInstallation = IsUsableExecutable(retocPath);
 
             if (!Environment.Is64BitOperatingSystem)
+            {
+                if (hasUsableInstallation) return;
                 throw new PlatformNotSupportedException("The selected retoc Windows release requires a 64-bit version of Windows.");
+            }
 
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
 
+            ReleaseInfo latestRelease;
             try
             {
-                ReleaseInfo release = FindLatestWindowsRelease();
-                using (var client = CreateWebClient())
-                    client.DownloadFile(release.DownloadUrl, zipPath);
+                latestRelease = FindLatestWindowsRelease();
+            }
+            catch
+            {
+                if (hasUsableInstallation) return;
+                throw;
+            }
 
-                var archiveInfo = new FileInfo(zipPath);
-                if (!archiveInfo.Exists || archiveInfo.Length <= 0 || archiveInfo.Length > MaximumArchiveBytes)
-                    throw new InvalidDataException("The downloaded retoc archive is empty or larger than the allowed size.");
+            if (hasUsableInstallation)
+            {
+                Version installedVersion = GetExecutableVersion(retocPath);
+                if (installedVersion != null && latestRelease.Version.CompareTo(installedVersion) <= 0)
+                    return;
+            }
 
-                string expectedHash = release.Sha256;
-                if (string.IsNullOrWhiteSpace(expectedHash) && !string.IsNullOrWhiteSpace(release.ChecksumUrl))
-                {
-                    try
-                    {
-                        using var client = CreateWebClient();
-                        string checksumText = client.DownloadString(release.ChecksumUrl);
-                        Match checksumMatch = Regex.Match(checksumText ?? string.Empty, @"\b[a-fA-F0-9]{64}\b");
-                        if (checksumMatch.Success) expectedHash = checksumMatch.Value;
-                    }
-                    catch
-                    {
-                        // Checksum sidecars are optional; the release asset is still downloaded over HTTPS.
-                    }
-                }
-
-                if (!string.IsNullOrWhiteSpace(expectedHash))
-                {
-                    string actualHash = ComputeSha256(zipPath);
-                    if (!string.Equals(NormalizeHash(expectedHash), actualHash, StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidDataException("The retoc archive SHA-256 checksum does not match the release metadata.");
-                }
-
-                using (var stream = File.OpenRead(zipPath))
-                using (var archive = new ZipArchive(stream, ZipArchiveMode.Read))
-                {
-                    ZipArchiveEntry executable = archive.Entries
-                        .Where(entry => !string.IsNullOrWhiteSpace(entry.Name) &&
-                                        string.Equals(Path.GetExtension(entry.Name), ".exe", StringComparison.OrdinalIgnoreCase))
-                        .OrderByDescending(entry => string.Equals(entry.Name, "retoc.exe", StringComparison.OrdinalIgnoreCase) ? 3 :
-                                                    string.Equals(entry.Name, "retoc_cli.exe", StringComparison.OrdinalIgnoreCase) ? 2 :
-                                                    entry.Name.IndexOf("retoc", StringComparison.OrdinalIgnoreCase) >= 0 ? 1 : 0)
-                        .FirstOrDefault() ?? throw new InvalidDataException("The latest Windows retoc ZIP did not contain an executable.");
-                    if (executable.Length <= 100000 || executable.Length > MaximumArchiveBytes)
-                        throw new InvalidDataException("The retoc executable in the release archive has an unexpected size.");
-
-                    using Stream input = executable.Open();
-                    using var output = new FileStream(extractedPath, FileMode.Create, FileAccess.Write, FileShare.None);
-                    input.CopyTo(output);
-                }
-
-                if (!IsUsableExecutable(extractedPath))
-                    throw new InvalidDataException("The extracted retoc executable is missing or incomplete.");
-
-                if (File.Exists(retocPath)) File.Delete(retocPath);
-                File.Move(extractedPath, retocPath);
+            try
+            {
+                DownloadAndInstall(latestRelease, retocPath, zipPath, extractedPath, backupPath);
+            }
+            catch
+            {
+                if (hasUsableInstallation && IsUsableExecutable(retocPath))
+                    return;
+                throw;
             }
             finally
             {
                 TryDelete(zipPath);
                 TryDelete(extractedPath);
             }
+        }
+
+        private static void RecoverInterruptedUpdate(string retocPath, string backupPath)
+        {
+            bool hasUsableRetoc = IsUsableExecutable(retocPath);
+            bool hasUsableBackup = IsUsableExecutable(backupPath);
+
+            if (hasUsableRetoc)
+            {
+                TryDelete(backupPath);
+                return;
+            }
+
+            if (!hasUsableBackup) return;
+
+            TryDelete(retocPath);
+            if (!File.Exists(retocPath))
+            {
+                try { File.Move(backupPath, retocPath); }
+                catch { }
+            }
+        }
+
+        private static void DownloadAndInstall(ReleaseInfo release, string retocPath, string zipPath, string extractedPath, string backupPath)
+        {
+            using (var client = CreateWebClient())
+                client.DownloadFile(release.DownloadUrl, zipPath);
+
+            var archiveInfo = new FileInfo(zipPath);
+            if (!archiveInfo.Exists || archiveInfo.Length <= 0 || archiveInfo.Length > MaximumArchiveBytes)
+                throw new InvalidDataException("The downloaded retoc archive is empty or larger than the allowed size.");
+
+            string expectedHash = release.Sha256;
+            if (string.IsNullOrWhiteSpace(expectedHash) && !string.IsNullOrWhiteSpace(release.ChecksumUrl))
+            {
+                try
+                {
+                    using var client = CreateWebClient();
+                    string checksumText = client.DownloadString(release.ChecksumUrl);
+                    Match checksumMatch = Regex.Match(checksumText ?? string.Empty, @"\b[a-fA-F0-9]{64}\b");
+                    if (checksumMatch.Success) expectedHash = checksumMatch.Value;
+                }
+                catch
+                {
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(expectedHash))
+            {
+                string actualHash = ComputeSha256(zipPath);
+                if (!string.Equals(NormalizeHash(expectedHash), actualHash, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("The retoc archive SHA-256 checksum does not match the release metadata.");
+            }
+
+            using (var stream = File.OpenRead(zipPath))
+            using (var archive = new ZipArchive(stream, ZipArchiveMode.Read))
+            {
+                ZipArchiveEntry executable = archive.Entries
+                    .Where(entry => !string.IsNullOrWhiteSpace(entry.Name) &&
+                                    string.Equals(Path.GetExtension(entry.Name), ".exe", StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(entry => string.Equals(entry.Name, "retoc.exe", StringComparison.OrdinalIgnoreCase) ? 3 :
+                                                string.Equals(entry.Name, "retoc_cli.exe", StringComparison.OrdinalIgnoreCase) ? 2 :
+                                                entry.Name.IndexOf("retoc", StringComparison.OrdinalIgnoreCase) >= 0 ? 1 : 0)
+                    .FirstOrDefault() ?? throw new InvalidDataException("The latest Windows retoc ZIP did not contain an executable.");
+
+                if (executable.Length <= 100000 || executable.Length > MaximumArchiveBytes)
+                    throw new InvalidDataException("The retoc executable in the release archive has an unexpected size.");
+
+                using Stream input = executable.Open();
+                using var output = new FileStream(extractedPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                input.CopyTo(output);
+            }
+
+            if (!IsUsableExecutable(extractedPath))
+                throw new InvalidDataException("The extracted retoc executable is missing or incomplete.");
+
+            ReplaceExecutable(extractedPath, retocPath, backupPath);
+
+            if (!IsUsableExecutable(retocPath))
+                throw new InvalidDataException("The installed retoc executable failed validation.");
+        }
+
+        private static void ReplaceExecutable(string extractedPath, string retocPath, string backupPath)
+        {
+            if (!File.Exists(retocPath))
+            {
+                File.Move(extractedPath, retocPath);
+                return;
+            }
+
+            TryDelete(backupPath);
+
+            try
+            {
+                File.Replace(extractedPath, retocPath, backupPath, true);
+            }
+            catch
+            {
+                if (!File.Exists(extractedPath) && IsUsableExecutable(retocPath))
+                    return;
+
+                File.Move(retocPath, backupPath);
+                try
+                {
+                    File.Move(extractedPath, retocPath);
+                }
+                catch
+                {
+                    if (!File.Exists(retocPath) && File.Exists(backupPath))
+                        File.Move(backupPath, retocPath);
+                    throw;
+                }
+            }
+
+            TryDelete(backupPath);
         }
 
         private static ReleaseInfo FindLatestWindowsRelease()
@@ -153,6 +244,9 @@ namespace RetocExtractor.RetocExtractor.Codes
             if (serializer.DeserializeObject(json) is not IDictionary<string, object> root)
                 throw new InvalidDataException("GitHub did not return a valid retoc release response.");
 
+            string tagName = GetJsonString(root, "tag_name");
+            Version releaseVersion = ParseVersion(tagName);
+
             if (!root.TryGetValue("assets", out object assetsValue))
                 throw new InvalidDataException("GitHub did not return a valid retoc release response.");
 
@@ -167,6 +261,7 @@ namespace RetocExtractor.RetocExtractor.Codes
                 string name = GetJsonString(asset, "name");
                 string url = GetJsonString(asset, "browser_download_url");
                 if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(url)) continue;
+
                 candidates.Add(new ReleaseAsset
                 {
                     Name = name,
@@ -180,6 +275,7 @@ namespace RetocExtractor.RetocExtractor.Codes
                                 asset.Name.IndexOf("windows-msvc", StringComparison.OrdinalIgnoreCase) >= 0 &&
                                 asset.Name.IndexOf("x86_64", StringComparison.OrdinalIgnoreCase) >= 0)
                 .FirstOrDefault() ?? throw new InvalidDataException("The latest retoc release does not provide a Windows MSVC ZIP asset.");
+
             string digest = windowsZip.Digest ?? string.Empty;
             if (digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
                 digest = digest.Substring("sha256:".Length);
@@ -189,10 +285,80 @@ namespace RetocExtractor.RetocExtractor.Codes
 
             return new ReleaseInfo
             {
+                Version = releaseVersion,
+                VersionTag = tagName,
                 DownloadUrl = windowsZip.DownloadUrl,
                 Sha256 = NormalizeHash(digest),
                 ChecksumUrl = checksum == null ? string.Empty : checksum.DownloadUrl
             };
+        }
+
+        private static Version GetExecutableVersion(string executablePath)
+        {
+            try
+            {
+                var output = new StringBuilder();
+                object outputLock = new();
+
+                using (var process = new Process())
+                {
+                    process.StartInfo = new ProcessStartInfo
+                    {
+                        FileName = executablePath,
+                        Arguments = "--version",
+                        WorkingDirectory = Path.GetDirectoryName(executablePath),
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
+                    };
+
+                    process.OutputDataReceived += (sender, args) =>
+                    {
+                        if (args.Data == null) return;
+                        lock (outputLock) output.AppendLine(args.Data);
+                    };
+                    process.ErrorDataReceived += (sender, args) =>
+                    {
+                        if (args.Data == null) return;
+                        lock (outputLock) output.AppendLine(args.Data);
+                    };
+
+                    if (!process.Start()) return null;
+                    process.BeginOutputReadLine();
+                    process.BeginErrorReadLine();
+
+                    if (!process.WaitForExit(10000))
+                    {
+                        try { process.Kill(); }
+                        catch { }
+                        return null;
+                    }
+
+                    process.WaitForExit();
+                    if (process.ExitCode != 0) return null;
+                }
+
+                return ParseVersion(output.ToString());
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static Version ParseVersion(string value)
+        {
+            Match match = Regex.Match(value ?? string.Empty, @"(?<!\d)(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?");
+            if (!match.Success)
+                throw new InvalidDataException("Could not determine the retoc release version.");
+
+            int major = int.Parse(match.Groups[1].Value);
+            int minor = int.Parse(match.Groups[2].Value);
+            int build = int.Parse(match.Groups[3].Value);
+            if (match.Groups[4].Success)
+                return new Version(major, minor, build, int.Parse(match.Groups[4].Value));
+            return new Version(major, minor, build);
         }
 
         private static string GetJsonString(IDictionary<string, object> values, string key)
@@ -231,9 +397,8 @@ namespace RetocExtractor.RetocExtractor.Codes
             try
             {
                 if (!File.Exists(path) || new FileInfo(path).Length <= 100000) return false;
-                using var stream = File.OpenRead(path);
+                using FileStream stream = File.OpenRead(path);
                 using var reader = new BinaryReader(stream);
-                // Validate the DOS/PE signature and require the AMD64 machine type.
                 if (reader.ReadUInt16() != 0x5A4D) return false;
                 stream.Position = 0x3C;
                 int peOffset = reader.ReadInt32();
@@ -242,17 +407,27 @@ namespace RetocExtractor.RetocExtractor.Codes
                 if (reader.ReadUInt32() != 0x00004550) return false;
                 return reader.ReadUInt16() == 0x8664;
             }
-            catch { return false; }
+            catch
+            {
+                return false;
+            }
         }
 
         private static void TryDelete(string path)
         {
-            try { if (File.Exists(path)) File.Delete(path); }
-            catch { }
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch
+            {
+            }
         }
 
         private sealed class ReleaseInfo
         {
+            public Version Version { get; set; }
+            public string VersionTag { get; set; }
             public string DownloadUrl { get; set; }
             public string Sha256 { get; set; }
             public string ChecksumUrl { get; set; }

@@ -70,6 +70,7 @@ namespace RetocExtractor.RetocExtractor.Codes
             }
             catch
             {
+                // Preserve corrupt settings for manual recovery before using defaults.
                 try
                 {
                     if (File.Exists(sourceFile))
@@ -80,6 +81,7 @@ namespace RetocExtractor.RetocExtractor.Codes
                 }
                 catch
                 {
+                    // Startup must continue if the recovery copy cannot be created.
                 }
                 settings = null;
             }
@@ -109,6 +111,7 @@ namespace RetocExtractor.RetocExtractor.Codes
                 try { Save(settings); }
                 catch
                 {
+                    // Startup continues; the next settings change will attempt another save.
                 }
             }
             return settings;

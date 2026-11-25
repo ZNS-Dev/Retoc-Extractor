@@ -40,6 +40,7 @@ namespace RetocExtractor
         private Timer searchDebounceTimer;
         private string loadedAssetsSourceFolder = string.Empty;
         private string loadedAssetsAesKey = string.Empty;
+        private string loadedAssetsVersionToken = string.Empty;
         private string selectedContainerKey = string.Empty;
         private string selectedFolderPath = string.Empty;
         private readonly string assetsHeaderBase = string.Empty;
@@ -275,7 +276,7 @@ namespace RetocExtractor
             var versionToolTip = new ToolTip(components);
             versionToolTip.SetToolTip(
                 cmbVersion,
-                "Patch release labels are displayed for clarity; retoc receives the matching UE major/minor version.");
+                "Select the game's exact Unreal Engine major/minor version (for example, UE 5.4.x = UE5_4). Changing this selection automatically reloads the assets.");
             UpdateBrowserHeader();
 
             btnBrowsePaks.Click += (s, e) => BrowsePaks();
@@ -330,7 +331,7 @@ namespace RetocExtractor
 
             txtPaks.Leave += (s, e) => SaveCurrentProfile();
             txtAesKey.Leave += (s, e) => SaveCurrentProfile();
-            cmbVersion.SelectedIndexChanged += (s, e) => SaveCurrentProfile();
+            cmbVersion.SelectedIndexChanged += CmbVersion_SelectedIndexChanged;
             FormClosing += (s, e) =>
             {
                 System.Threading.Interlocked.Increment(ref searchRequestVersion);
@@ -558,7 +559,10 @@ namespace RetocExtractor
             AddFolderTreeChildren(node, nodeInfo.ContainerKey, nodeInfo.FolderPath);
         }
 
-        private void TrvFolders_BeforeExpand(object sender, TreeViewCancelEventArgs e) => PopulateFolderNode(e.Node);
+        private void TrvFolders_BeforeExpand(object sender, TreeViewCancelEventArgs e)
+        {
+            PopulateFolderNode(e.Node);
+        }
 
         private TreeNode FindFolderNode(TreeNode root, string path)
         {
@@ -736,14 +740,12 @@ namespace RetocExtractor
                     ? container.DisplayName
                     : container.DisplayName + "  /  " + selectedFolderPath)
                 : "No UCAS files loaded";
-#pragma warning disable IDE0059 // Assignation inutile d'une valeur
             if (assetContainersByKey.TryGetValue(selectedContainerKey ?? string.Empty, value: out AssetContainer selected))
             {
                 int shownCount = visibleAssets == null ? 0 : visibleAssets.Count;
                 suffix += " — " + shownCount.ToString("N0", CultureInfo.CurrentCulture) +
                     (shownCount == 1 ? " result" : " results");
             }
-#pragma warning restore IDE0059 // Assignation inutile d'une valeur
             lblAssetsHeader.Text = prefix + "  /  " + suffix;
         }
 
@@ -802,6 +804,7 @@ namespace RetocExtractor
             virtualItemCacheStart = -1;
             loadedAssetsSourceFolder = string.Empty;
             loadedAssetsAesKey = string.Empty;
+            loadedAssetsVersionToken = string.Empty;
             selectedContainerKey = string.Empty;
             selectedFolderPath = string.Empty;
             if (lstAssets.VirtualMode)
@@ -1072,6 +1075,16 @@ namespace RetocExtractor
             await TryAutoLoadAssetsAsync();
         }
 
+        private void CmbVersion_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (isDesignTime || loadingProfile || !profileReady)
+                return;
+
+            ClearLoadedAssets();
+            SaveCurrentProfile();
+            SchedulePaksAutoLoad();
+        }
+
         private async Task TryAutoLoadAssetsAsync()
         {
             if (isDesignTime || loadingProfile || !profileReady || busy)
@@ -1087,9 +1100,14 @@ namespace RetocExtractor
 
             string normalizedFolder = NormalizePaksFolderPath(paks);
             string aesKey = (txtAesKey.Text ?? string.Empty).Trim();
+            string versionToken = ToRetocVersionToken(
+                cmbVersion.SelectedItem == null
+                    ? DefaultUnrealVersionDisplayName
+                    : cmbVersion.SelectedItem.ToString());
             if (HasLoadedAssets() &&
                 string.Equals(normalizedFolder, loadedAssetsSourceFolder, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(aesKey, loadedAssetsAesKey, StringComparison.OrdinalIgnoreCase))
+                string.Equals(aesKey, loadedAssetsAesKey, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(versionToken, loadedAssetsVersionToken, StringComparison.OrdinalIgnoreCase))
                 return;
 
             try
@@ -1193,6 +1211,12 @@ namespace RetocExtractor
                 ContainerInventory inventory = await Task.Run(() => BuildContainerInventory(paks));
                 string[] tocFiles = inventory.TocFiles;
                 List<ContainerScanEntry> scanEntries = inventory.Containers;
+                string aesKey = (txtAesKey.Text ?? string.Empty).Trim();
+                string selectedVersionDisplay = cmbVersion.SelectedItem == null
+                    ? DefaultUnrealVersionDisplayName
+                    : cmbVersion.SelectedItem.ToString();
+                string selectedVersionToken = ToRetocVersionToken(selectedVersionDisplay);
+
                 if (tocFiles.Length == 0 && scanEntries.Count == 0)
                 {
                     string message = inventory.GlobalContainerExcluded
@@ -1200,6 +1224,43 @@ namespace RetocExtractor
                         : "No .utoc files were found directly in this folder. Choose the Content\\Paks folder containing the containers.";
                     MessageBox.Show(this, message, "No .utoc files", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
+                }
+
+                if (tocFiles.Length > 0)
+                {
+                    RetocContainerMetadata detectedVersion;
+                    try
+                    {
+                        detectedVersion = await Task.Run(() => ReadRetocContainerMetadata(retoc, tocFiles[0], aesKey));
+                    }
+                    catch (Exception metadataError)
+                    {
+                        ClearLoadedAssets();
+                        MessageBox.Show(this,
+                            "The game's Unreal Engine format could not be verified. No assets will be shown until Retoc can read the .utoc metadata." +
+                            Environment.NewLine + Environment.NewLine +
+                            "Check the AES key and the selected Paks folder." +
+                            Environment.NewLine + Environment.NewLine + metadataError.Message,
+                            "Unable to verify Unreal version", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+
+                    if (!IsSelectedVersionMatch(selectedVersionToken, detectedVersion))
+                    {
+                        ClearLoadedAssets();
+                        MessageBox.Show(this,
+                            "The selected Unreal Engine version does not match the game's IoStore format." +
+                            Environment.NewLine + Environment.NewLine +
+                            "Selected: UE " + selectedVersionDisplay + " (" + selectedVersionToken + ")" +
+                            Environment.NewLine +
+                            "Detected TOC version: " + detectedVersion.TocVersion +
+                            Environment.NewLine +
+                            "Detected container header: " + detectedVersion.ContainerHeaderVersion +
+                            Environment.NewLine + Environment.NewLine +
+                            "Select the matching Unreal Engine version. Assets have not been loaded.",
+                            "Unreal Engine version mismatch", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
                 }
 
                 var containerByToc = new Dictionary<string, ContainerScanEntry>(StringComparer.OrdinalIgnoreCase);
@@ -1210,7 +1271,6 @@ namespace RetocExtractor
                 }
 
                 var sourceChunksById = new Dictionary<string, ChunkListingEntry>(StringComparer.OrdinalIgnoreCase);
-                string aesKey = (txtAesKey.Text ?? string.Empty).Trim();
                 var mergeLock = new object();
                 var failedContainers = new List<string>();
                 int nextContainerIndex = -1;
@@ -1357,6 +1417,10 @@ namespace RetocExtractor
                 ApplySearch();
                 loadedAssetsSourceFolder = NormalizePaksFolderPath(paks);
                 loadedAssetsAesKey = aesKey;
+                loadedAssetsVersionToken = ToRetocVersionToken(
+                    cmbVersion.SelectedItem == null
+                        ? DefaultUnrealVersionDisplayName
+                        : cmbVersion.SelectedItem.ToString());
 
                 if (tocFiles.Length == 0)
                 {
@@ -1588,6 +1652,117 @@ namespace RetocExtractor
                 return false;
             return !path.StartsWith("Engine/", StringComparison.OrdinalIgnoreCase) &&
                    path.IndexOf("/Engine/", StringComparison.OrdinalIgnoreCase) < 0;
+        }
+
+        private sealed class RetocContainerMetadata
+        {
+            public string TocVersion { get; set; }
+            public string ContainerHeaderVersion { get; set; }
+        }
+
+        private static bool TryGetExpectedIoStoreVersions(string engineVersionToken, out string tocVersion, out string containerHeaderVersion)
+        {
+            tocVersion = string.Empty;
+            containerHeaderVersion = string.Empty;
+
+            switch ((engineVersionToken ?? string.Empty).Trim().ToUpperInvariant())
+            {
+                case "UE5_0":
+                    tocVersion = "PerfectHashWithOverflow";
+                    containerHeaderVersion = "LocalizedPackages";
+                    return true;
+                case "UE5_1":
+                case "UE5_2":
+                    tocVersion = "PerfectHashWithOverflow";
+                    containerHeaderVersion = "OptionalSegmentPackages";
+                    return true;
+                case "UE5_3":
+                    tocVersion = "PerfectHashWithOverflow";
+                    containerHeaderVersion = "NoExportInfo";
+                    return true;
+                case "UE5_4":
+                    tocVersion = "OnDemandMetaData";
+                    containerHeaderVersion = "NoExportInfo";
+                    return true;
+                case "UE5_5":
+                    tocVersion = "ReplaceIoChunkHashWithIoHash";
+                    containerHeaderVersion = "SoftPackageReferences";
+                    return true;
+                case "UE5_6":
+                case "UE5_7":
+                    tocVersion = "ReplaceIoChunkHashWithIoHash";
+                    containerHeaderVersion = "SoftPackageReferencesOffset";
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool IsSelectedVersionMatch(string engineVersionToken, RetocContainerMetadata detected)
+        {
+            if (detected == null ||
+                !TryGetExpectedIoStoreVersions(engineVersionToken, out string expectedTocVersion, out string expectedHeaderVersion))
+                return false;
+
+            return string.Equals(detected.TocVersion, expectedTocVersion, StringComparison.OrdinalIgnoreCase) &&
+                   string.Equals(detected.ContainerHeaderVersion, expectedHeaderVersion, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static RetocContainerMetadata ReadRetocContainerMetadata(string retocPath, string tocPath, string aesKey)
+        {
+            var arguments = new List<string>();
+            if (!string.IsNullOrWhiteSpace(aesKey))
+            {
+                arguments.Add("--aes-key");
+                arguments.Add(aesKey);
+            }
+            arguments.Add("info");
+            arguments.Add(tocPath);
+
+            var start = new ProcessStartInfo
+            {
+                FileName = retocPath,
+                Arguments = string.Join(" ", arguments.Select(QuoteArgument)),
+                WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(retocPath)),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = new UTF8Encoding(false),
+                StandardErrorEncoding = new UTF8Encoding(false)
+            };
+
+            using var process = new Process { StartInfo = start };
+            process.Start();
+            Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+            Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+
+            if (!process.WaitForExit((int)TimeSpan.FromMinutes(2).TotalMilliseconds))
+            {
+                try { process.Kill(); } catch { }
+                process.WaitForExit();
+                throw new TimeoutException("retoc info did not finish within 2 minutes.");
+            }
+
+            Task.WaitAll(stdoutTask, stderrTask);
+            string output = (stdoutTask.Result ?? string.Empty) + Environment.NewLine + (stderrTask.Result ?? string.Empty);
+            if (process.ExitCode != 0)
+                throw new InvalidOperationException("retoc info failed with exit code " + process.ExitCode + ". " + output.Trim());
+
+            Match tocMatch = Regex.Match(output, @"(?im)^\s*version:\s*(?<value>[A-Za-z0-9_]+)\s*$");
+            Match headerMatch = Regex.Match(output, @"(?im)^\s*container_header_version:\s*Some\((?<value>[A-Za-z0-9_]+)\)\s*$");
+
+            if (!tocMatch.Success || !headerMatch.Success)
+            {
+                throw new InvalidDataException(
+                    "retoc info did not return both the TOC version and the container header version. " + output.Trim());
+            }
+
+            return new RetocContainerMetadata
+            {
+                TocVersion = tocMatch.Groups["value"].Value,
+                ContainerHeaderVersion = headerMatch.Groups["value"].Value
+            };
         }
 
         private static ListingResult ListContainer(string retocPath, string tocPath, string aesKey)
@@ -2207,6 +2382,7 @@ namespace RetocExtractor
                 string[] pathMatches = [.. matches.Where(path =>
                     Path.GetFullPath(path).EndsWith(suffix, StringComparison.OrdinalIgnoreCase) ||
                     Path.GetFullPath(path).EndsWith(Path.ChangeExtension(suffix, extension), StringComparison.OrdinalIgnoreCase))];
+                // Never choose between duplicate output stems without an exact path match.
                 return pathMatches.Length == 1 ? pathMatches[0] : null;
             }
             catch { return null; }

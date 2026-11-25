@@ -5,7 +5,10 @@ namespace RetocExtractor
 {
     public partial class ProfileNameDialog : Form
     {
-        public ProfileNameDialog() => InitializeComponent();
+        public ProfileNameDialog()
+        {
+            InitializeComponent();
+        }
 
         public string ProfileName
         {

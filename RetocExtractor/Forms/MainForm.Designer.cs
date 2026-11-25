@@ -366,7 +366,7 @@ namespace RetocExtractor
             this.txt_version.Name = "txt_version";
             this.txt_version.Size = new System.Drawing.Size(31, 15);
             this.txt_version.TabIndex = 26;
-            this.txt_version.Text = "1.0.0";
+            this.txt_version.Text = "1.0.1";
             // 
             // MainForm
             // 
