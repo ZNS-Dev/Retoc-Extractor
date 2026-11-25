@@ -10,7 +10,7 @@
 > Select the location of a **Paks** folder, add the **AES key** if needed. Enjoy!
 
 <p align="center">
-
+<img width="1008" height="732" alt="image" src="https://github.com/user-attachments/assets/3ac8569f-6f64-4b85-aa7a-0959957ce8b4" />
 
 ## Features & Improvements
 - Automatic Update
